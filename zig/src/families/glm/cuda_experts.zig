@@ -14,17 +14,21 @@ pub const Which = enum(u2) { gate_up, down_f32, down };
 /// Upstream's NVFP4 experts and plan kernels.
 pub const Kernels = struct {
     nvfp4: cuda.experts.Nvfp4Experts,
+    fp8g: cuda.experts.Fp8Experts,
     router: cuda.grouped.Router,
 
     /// `plans`: the loaded experts module (its plan kernels).
     pub fn load(d: *const cuda.Driver, plans: cuda.Module, sms: u32) !Kernels {
         var nvfp4 = try cuda.experts.Nvfp4Experts.load(d, sms);
         errdefer nvfp4.unload();
-        return .{ .nvfp4 = nvfp4, .router = try cuda.grouped.Router.resolve(plans) };
+        var fp8g = try cuda.experts.Fp8Experts.load(d, sms);
+        errdefer fp8g.unload();
+        return .{ .nvfp4 = nvfp4, .fp8g = fp8g, .router = try cuda.grouped.Router.resolve(plans) };
     }
 
     pub fn unload(k: *Kernels) void {
         k.nvfp4.unload();
+        k.fp8g.unload();
     }
 };
 
@@ -38,7 +42,7 @@ pub fn route(ks: *const Kernels, stream: cuda.Stream, picks: u64, pairs: usize, 
 
 /// nvx.gate_up / down (prompt_* on a prompt plan): `x` rows -> `out` bf16 SwiGLU, fp32 or bf16; `skip` untouched.
 pub fn run(ks: *const Kernels, stream: cuda.Stream, which: Which, l: cuda.experts.Layer, plan: Plan, x: u64, x_stride: usize, rows: usize, out: u64, skip: i32) !void {
-    const g: cuda.experts.Grouped = .{ .nvfp4 = &ks.nvfp4 };
+    const g: cuda.experts.Grouped = .{ .nvfp4 = &ks.nvfp4, .fp8g = &ks.fp8g };
     const epi: cuda.experts.Epi = switch (which) {
         .gate_up => .up,
         .down_f32 => .down_f32,

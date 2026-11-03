@@ -11,6 +11,7 @@ pub const Weights = union(enum) {
     nvfp4: struct { gate: cuda.qmmf.Weight, up: cuda.qmmf.Weight, down: cuda.qmmf.Weight },
     bf16: struct { gu: u64, down: u64 }, // [gate | up] rows [2 width][dims], down [dims][width]
     mxfp8: struct { gu: cuda.qmmf.Weight, down: cuda.qmmf.Weight }, // the same two, packed for the lane
+    fp8g: struct { gu: cuda.qmmf.Weight, down: cuda.qmmf.Weight }, // the FP8 release's, packed for the lane
 };
 
 /// One dense layer on a rank: gate and up [width][dims] and down [dims][width].
@@ -44,6 +45,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi
         .nvfp4 => |w| try mm(k, stream, w.down, s.act + lo * l.width * 2, l.width, hi - lo, out, true, prompt),
         .bf16 => |w| try b16.matmul(k.set, stream, s.act + lo * l.width * 2, l.width, w.down, out, s.mm_part, hi - lo, l.dims, l.width, true),
         .mxfp8 => |w| try projection.matmul(k.set, stream, .{ .mxfp8 = w.down }, s.act + lo * l.width * 2, l.width, out, s.mm_part, hi - lo, l.dims, l.width, true),
+        .fp8g => |w| try projection.matmul(k.set, stream, .{ .fp8g = w.down }, s.act + lo * l.width * 2, l.width, out, s.mm_part, hi - lo, l.dims, l.width, true),
     }
 }
 
@@ -54,6 +56,10 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         .nvfp4 => |q| q,
         .bf16 => |b| { // [gate | up] in one matmul, as the shared expert's
             try b16.matmul(k.set, stream, x, x_stride, b.gu, s.gu, s.mm_part, rows, 2 * w, l.dims, false);
+            return glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
+        },
+        .fp8g => |m| { // as MXFP8's
+            try projection.matmul(k.set, stream, .{ .fp8g = m.gu }, x, x_stride, s.gu, s.mm_part, rows, 2 * w, l.dims, false);
             return glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
         },
         .mxfp8 => |m| { // [gate | up] stacked on the lane, its rows straight into s.gu

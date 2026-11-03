@@ -88,6 +88,7 @@ const Loader = struct {
     last: []const u8 = "", // the tensor `get` read last, named when its values are refused
     staging: @import("cuda_load_pack.zig").Staging = .{}, // the packed experts' mapped pinned memory, piece to piece
     recipes: ?*const core.modelopt.Recipes = null, // MIXED_PRECISION's table; null: the tensors decide (NVFP4)
+    fp8_release: bool = false, // quant_method fp8: the tensors decide (bf16 or block FP8)
 
     pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
         L.last = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
@@ -119,7 +120,7 @@ const Loader = struct {
         var buf: [224]u8 = undefined;
         const w = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{module}));
         const scale_name = try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module});
-        const s: ?Tensor = if (ck.has(scale_name)) try ck.get(scale_name) else null;
+        const s: ?Tensor = if (ck.has(scale_name)) try ck.get(scale_name) else if (ck.has(try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{module}))) try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{module})) else null;
         const stored: formats.Stored = .{
             .weight = .{ .dtype = w.dtype, .shape = w.shape[0..w.rank] },
             .scale = if (s) |*t| .{ .dtype = t.dtype, .shape = t.shape[0..t.rank] } else null,
@@ -140,6 +141,7 @@ const Loader = struct {
 
     /// What config.json declares `module` to be: its MIXED_PRECISION recipe, or NVFP4 for every quantized linear.
     pub fn declaredAs(L: *const Loader, module: []const u8) formats.Declared {
+        if (L.fp8_release) return .fp8_release;
         return if (L.recipes) |r| .{ .mixed = r.of(module) } else .nvfp4;
     }
 
@@ -334,14 +336,19 @@ const Loader = struct {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
-        const mx = !c.exl3 and (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's
-        const want: formats.Format = if (c.exl3) .bf16 else if (mx) .mxfp8 else .nvfp4;
+        const mx = !c.exl3 and !c.fp8 and (try L.get("layers.{d}.mlp.gate_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's
+        const want: formats.Format = if (c.exl3) .bf16 else if (c.fp8) .fp8_pb else if (mx) .mxfp8 else .nvfp4;
         inline for (.{ "gate_proj", "up_proj", "down_proj" }) |x| try L.format("layers.{d}.mlp." ++ x, .{i}, want);
         const w: mlp.Weights = if (c.exl3) bf16: { // an EXL3 checkpoint keeps its dense layers bf16
             inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp." ++ x ++ ".weight", .{i}), s.lo, s.hi, c.dense_inter, .bf16);
             const gu = try L.put("layers.{d}.mlp.gu", .{i});
             try L.cols(try L.get("layers.{d}.mlp.down_proj.weight", .{i}), s.lo, s.hi, .bf16);
             break :bf16 .{ .bf16 = .{ .gu = gu, .down = try L.put("layers.{d}.mlp.down", .{i}) } };
+        } else if (c.fp8) fp8: { // the FP8 release's block FP8
+            const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+            const gu = try formats.cutProj(L, prefix, i, &parts, &.{.fp8_pb}, "layers.{d}.mlp.gu");
+            const down = try formats.cutProj(L, prefix, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{.fp8_pb}, "layers.{d}.mlp.down");
+            break :fp8 .{ .fp8g = .{ .gu = gu.fp8g, .down = down.fp8g } };
         } else if (mx) mx8: {
             const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
             const gu = try formats.cutProj(L, prefix, i, &parts, &.{.mxfp8}, "layers.{d}.mlp.gu");
@@ -442,7 +449,7 @@ const Loader = struct {
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
             if (!x3.?.shx) L.w.exl3_shx = false;
-        } else routed = try L.nvfp4Experts(i);
+        } else routed = if (c.fp8) try L.fp8Experts(i) else try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
         const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
@@ -464,6 +471,57 @@ const Loader = struct {
     }
 
     /// Layer `i`'s routed NVFP4 experts packed as Experts4 (the MTP layer's quantized from its BF16 ones).
+    /// The FP8 release's routed experts: e4m3 codes and fp32 128 x 128 block scales, cut to the rank and packed for fp8g.
+    fn fp8Experts(L: *Loader, i: u32) !cuda.experts.Layer {
+        const c = &L.w.config;
+        const d: usize = c.hidden;
+        const total: usize = c.moe_inter;
+        const cut = L.w.share.moe;
+        const ni = cut.len();
+        const count: usize = c.experts;
+        const job: Fp8Pack = .{ .d = d, .total = total, .lo = cut.lo, .ni = ni };
+        const up = try L.gpa.alloc(u32, count * job.upLen());
+        defer L.gpa.free(up);
+        const down = try L.gpa.alloc(u32, count * job.downLen());
+        defer L.gpa.free(down);
+        const up_scale = try L.gpa.alloc(f32, count * job.upScales());
+        defer L.gpa.free(up_scale);
+        const down_scale = try L.gpa.alloc(f32, count * job.downScales());
+        defer L.gpa.free(down_scale);
+        const stored = try L.gpa.alloc([6]Tensor, count); // read here: the checkpoint marks what is read
+        defer L.gpa.free(stored);
+        for (stored, 0..) |*t, e| {
+            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+                try L.format("layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e }, .fp8_pb);
+                t[m] = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".weight", .{ i, e });
+                t[m + 3] = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".weight_scale_inv", .{ i, e });
+            }
+        }
+        const packing = @import("cuda_load_pack.zig");
+        const threads = packing.packers(@import("cuda_ranks.zig").environment("TF_GLM_LOAD_PACK")) catch |err| {
+            std.log.err("TF_GLM_LOAD_PACK: 1 to {d} packer threads", .{packing.max_packers});
+            return err;
+        };
+        var failure: ?anyerror = null;
+        var pool: [packing.max_packers]std.Thread = undefined;
+        var spawned: usize = 0;
+        const run: Fp8Pack.Run = .{ .job = job, .stored = stored, .up = up, .down = down, .up_scale = up_scale, .down_scale = down_scale, .stride = threads, .failure = &failure };
+        defer for (pool[0..spawned]) |t| t.join();
+        for (0..threads) |first| {
+            pool[first] = try std.Thread.spawn(.{}, Fp8Pack.Run.work, .{ run, first });
+            spawned += 1;
+        }
+        for (pool[0..spawned]) |t| t.join();
+        spawned = 0;
+        if (failure) |e| return e;
+        const keep = @import("cuda_upload_owner.zig").keep;
+        const up_at = try keep(L, try cuda.DeviceBuffer.fromHost(L.d, std.mem.sliceAsBytes(up)), "layers.{d}.moe.experts.up", .{i});
+        const down_at = try keep(L, try cuda.DeviceBuffer.fromHost(L.d, std.mem.sliceAsBytes(down)), "layers.{d}.moe.experts.down", .{i});
+        const us = try keep(L, try cuda.DeviceBuffer.fromHost(L.d, std.mem.sliceAsBytes(up_scale)), "layers.{d}.moe.experts.up_scale", .{i});
+        const ds = try keep(L, try cuda.DeviceBuffer.fromHost(L.d, std.mem.sliceAsBytes(down_scale)), "layers.{d}.moe.experts.down_scale", .{i});
+        return .{ .format = .fp8g, .up = up_at, .down = down_at, .up_scale = us, .down_scale = ds, .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
+    }
+
     fn nvfp4Experts(L: *Loader, i: u32) !cuda.experts.Layer {
         const c = &L.w.config;
         const d: usize = c.hidden;
@@ -531,6 +589,68 @@ fn recipeTable(r: *const core.modelopt.Recipes) ?*const core.modelopt.Recipes {
     return if (r.mixed) r else null;
 }
 
+/// One rank's cut of an FP8 release expert, packed as cuda.experts.Fp8Experts reads it.
+const Fp8Pack = struct {
+    d: usize, // the model's width
+    total: usize, // an expert's whole width
+    lo: usize, // the rank's first column of it, on a 128 block
+    ni: usize, // the rank's columns, whole 128 blocks
+
+    fn upLen(p: Fp8Pack) usize {
+        return p.ni * p.d * 2 / 4;
+    }
+    fn downLen(p: Fp8Pack) usize {
+        return p.d * p.ni / 4;
+    }
+    fn upScales(p: Fp8Pack) usize {
+        return 2 * (p.ni / 128) * (p.d / 128);
+    }
+    fn downScales(p: Fp8Pack) usize {
+        return (p.d / 128) * (p.ni / 128);
+    }
+
+    const Run = struct {
+        job: Fp8Pack,
+        stored: []const [6]Tensor,
+        up: []u32,
+        down: []u32,
+        up_scale: []f32,
+        down_scale: []f32,
+        stride: usize,
+        failure: *?anyerror,
+
+        fn work(r: Run, first: usize) void {
+            r.each(first) catch |e| {
+                r.failure.* = e;
+            };
+        }
+
+        fn each(r: Run, first: usize) !void {
+            const gpa = std.heap.c_allocator;
+            const p = r.job;
+            const cut = try gpa.alloc(u8, p.d * p.ni);
+            defer gpa.free(cut);
+            var e = first;
+            while (e < r.stored.len) : (e += r.stride) {
+                const t = r.stored[e];
+                const rows = t[0].bytes[p.lo * p.d..][0 .. p.ni * p.d]; // gate and up: the rank's rows, contiguous
+                const urows = t[1].bytes[p.lo * p.d..][0 .. p.ni * p.d];
+                try cuda.experts.Fp8Experts.packGateUp(gpa, r.up[e * p.upLen()..][0..p.upLen()], rows, urows, p.ni, p.d);
+                for (0..p.d) |row| @memcpy(cut[row * p.ni..][0..p.ni], t[2].bytes[row * p.total + p.lo..][0..p.ni]); // down: its columns
+                cuda.experts.Fp8Experts.packOne(r.down[e * p.downLen()..][0..p.downLen()], cut, p.d, p.ni);
+                const rb = p.ni / 128;
+                const cb = p.d / 128;
+                const us = std.mem.sliceAsBytes(r.up_scale[e * p.upScales()..][0..p.upScales()]);
+                const half = rb * cb * 4;
+                @memcpy(us[0..half], t[3].bytes[(p.lo / 128) * cb * 4..][0..half]);
+                @memcpy(us[half..][0..half], t[4].bytes[(p.lo / 128) * cb * 4..][0..half]);
+                const ds = std.mem.sliceAsBytes(r.down_scale[e * p.downScales()..][0..p.downScales()]);
+                for (0..cb) |row| @memcpy(ds[row * rb * 4..][0 .. rb * 4], t[5].bytes[(row * (p.total / 128) + p.lo / 128) * 4..][0 .. rb * 4]);
+            }
+        }
+    };
+};
+
 /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
     var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
@@ -539,7 +659,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     defer ck.close();
     var head_ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
     defer head_ck.close();
-    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
+    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck, .fp8_release = c.fp8 };
     defer L.host.deinit(gpa);
     defer L.staging.deinit();
     var recipes = try formats.readRecipes(gpa, io, dir);

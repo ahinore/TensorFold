@@ -17,7 +17,8 @@ pub const Fp8pb = struct {
     pub fn read(gpa: std.mem.Allocator, ck: *core.Checkpoint, module: []const u8) !Fp8pb {
         var buf: [256]u8 = undefined;
         const w = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{module}));
-        const s = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module}));
+        const named = try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module});
+        const s = if (ck.has(named)) try ck.get(named) else try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{module})); // the FP8 release's name
         _ = formats.of(.{ .mixed = .fp8_pb_wo }, .{ .weight = formats.metaOf(&w), .scale = formats.metaOf(&s) }) catch return error.BadFp8pb;
         const scales = try gpa.alloc(f32, s.numel());
         for (scales, 0..) |*v, j| v.* = @bitCast(std.mem.readInt(u32, s.bytes[4 * j ..][0..4], .little));

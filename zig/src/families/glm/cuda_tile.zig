@@ -52,7 +52,7 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
                 try add(list, gpa, &b.gu, 2 * x.width, x.dims);
                 try add(list, gpa, &b.down, x.dims, x.width);
             },
-            .nvfp4, .mxfp8 => {},
+            .nvfp4, .mxfp8, .fp8g => {},
         },
         .moe => |*x| {
             try addProj(list, gpa, &x.shared_gu, 2 * x.shared, x.routed.dims);

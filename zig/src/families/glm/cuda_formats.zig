@@ -25,6 +25,7 @@ pub const Stored = struct {
 pub const Declared = union(enum) {
     nvfp4,
     mixed: ?Recipe,
+    fp8_release, // quant_method "fp8": bf16 or block FP8, told by the tensors
 };
 
 /// Why `of` refuses: an empty shape, a width or block count that overflows, or tensors other than `declared` says.
@@ -35,6 +36,7 @@ pub fn of(declared: Declared, stored: Stored) Refusal!Format {
     const f = try fromTensors(stored);
     const ok = switch (declared) {
         .nvfp4 => f == .bf16 or f == .nvfp4,
+        .fp8_release => f == .bf16 or f == .fp8_pb,
         .mixed => |r| if (r) |recipe| switch (recipe) {
             .nvfp4, .w4a16_nvfp4 => f == .nvfp4,
             .nvfp4_csf => f == .nvfp4_csf,
@@ -131,6 +133,7 @@ pub fn plainLinear(ck: *core.Checkpoint, module: []const u8, declared: Declared)
     var buf: [256]u8 = undefined;
     if (ck.has(try std.fmt.bufPrint(&buf, "{s}.input_scale", .{module}))) return core.nvfp4.Linear.read(ck, module);
     const w4a16 = switch (declared) {
+        .fp8_release => false,
         .nvfp4 => false,
         .mixed => |r| if (r) |recipe| recipe == .w4a16_nvfp4 else false,
     };
@@ -255,6 +258,7 @@ fn laneRuns(L: anytype, w: cuda.qmmf.Weight, comptime name: []const u8, args: an
 pub fn describe(buf: []u8, module: []const u8, declared: Declared, stored: Stored) []const u8 {
     const said = switch (declared) {
         .nvfp4 => "NVFP4",
+        .fp8_release => "FP8 release",
         .mixed => |r| if (r) |recipe| @tagName(recipe) else "no recipe (bf16)",
     };
     return std.fmt.bufPrint(buf, "{s}: declared {s}, stored {s} {any}", .{ module, said, @tagName(stored.weight.dtype), stored.weight.shape }) catch buf;
@@ -262,8 +266,30 @@ pub fn describe(buf: []u8, module: []const u8, declared: Declared, stored: Store
 
 /// The entry's check (modelopt.admitRecipes), its table dropped: weights.load reads it again beside the tensors.
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *core.modelopt.Why) !void {
+    if (try admitFp8(gpa, config_json, why)) return;
     var recipes = try core.modelopt.admitRecipes(gpa, config_json, why);
     recipes.deinit();
+}
+
+/// True for quant_method "fp8" in e4m3 with 128 x 128 block scales (the official release); that method otherwise is refused.
+fn admitFp8(gpa: std.mem.Allocator, config_json: []const u8, why: *core.modelopt.Why) !bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_json, .{}) catch return false;
+    if (root != .object) return false;
+    const q = root.object.get("quantization_config") orelse return false;
+    if (q != .object) return false;
+    const m = q.object.get("quant_method") orelse return false;
+    if (m != .string or !std.mem.eql(u8, m.string, "fp8")) return false;
+    const fmt_ok = if (q.object.get("fmt")) |f| f == .string and std.mem.eql(u8, f.string, "e4m3") else false;
+    const size_ok = if (q.object.get("weight_block_size")) |b| b == .array and b.array.items.len == 2 and
+        b.array.items[0] == .integer and b.array.items[0].integer == 128 and
+        b.array.items[1] == .integer and b.array.items[1].integer == 128 else false;
+    if (!fmt_ok or !size_ok) {
+        why.set("quant_method fp8 other than e4m3 with 128 x 128 blocks", .{});
+        return error.UnsupportedQuant;
+    }
+    return true;
 }
 
 /// A routed expert's NVFP4 linear as read: scales as stored, or csf_32x2_v1's parts to decode; else refused by name.
@@ -315,6 +341,17 @@ const testing = std.testing;
 
 fn meta(dtype: core.checkpoint.DType, shape: []const usize) Meta {
     return .{ .dtype = dtype, .shape = shape };
+}
+
+test "the FP8 release: its projections are bf16 or block FP8, and only its own layout is admitted" {
+    const w = meta(.bf16, &.{ 8192, 4096 });
+    try testing.expectEqual(Format.bf16, try of(.fp8_release, .{ .weight = w }));
+    const up = meta(.f8_e4m3, &.{ 2048, 4096 });
+    try testing.expectEqual(Format.fp8_pb, try of(.fp8_release, .{ .weight = up, .scale = meta(.f32, &.{ 16, 32 }) }));
+    try testing.expectError(error.FormatMismatch, of(.fp8_release, .{ .weight = up, .scale = meta(.f32, &.{ 8, 32 }) }));
+    var why: core.modelopt.Why = .{};
+    try admit(testing.allocator, "{\"quantization_config\":{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[128,128]}}", &why);
+    try testing.expectError(error.UnsupportedQuant, admit(testing.allocator, "{\"quantization_config\":{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[64,64]}}", &why));
 }
 
 test "a recipe-less module of a MIXED_PRECISION checkpoint is bf16, and a plain NVFP4 one may be either" {
